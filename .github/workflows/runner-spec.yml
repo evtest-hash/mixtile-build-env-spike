@@ -1,0 +1,26 @@
+# Which runner spec does each label actually give this account?
+name: runner-spec
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  spec:
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [ubuntu-latest, ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.label }}
+    steps:
+      - run: |
+          echo "label:     ${{ matrix.label }}"
+          echo "os:        $(. /etc/os-release; echo "$PRETTY_NAME")"
+          echo "nproc:     $(nproc)"
+          echo "cpu:       $(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo)"
+          echo "mem:       $(free -h | awk '/^Mem:/{print $2}')"
+          echo "disk /:    $(df -h --output=avail / | tail -1 | tr -d ' ') free"
+          echo "disk /mnt: $(df -h --output=avail /mnt 2>/dev/null | tail -1 | tr -d ' ') free"
+          {
+            echo "| \`${{ matrix.label }}\` | $(nproc) vCPU | $(free -h | awk '/^Mem:/{print $2}') | $(df -h --output=avail / | tail -1 | tr -d ' ') on / | $(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo) |"
+          } >> "${GITHUB_STEP_SUMMARY}"
