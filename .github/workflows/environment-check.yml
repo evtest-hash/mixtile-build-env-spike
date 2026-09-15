@@ -1,0 +1,386 @@
+# GitHub Actions runner environment spike.
+#
+# Purpose: establish facts about a GitHub-hosted ubuntu-24.04 runner as a
+# NATIVE (non-Docker) build environment for arm64 Debian/Ubuntu rootfs and
+# image builds. This validates the environment only -- it builds no product.
+#
+# No Docker is used anywhere in this workflow, by design.
+name: environment-check
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  environment-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RESULTS: /tmp/spike/results.txt
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: 0. init result log
+        run: |
+          mkdir -p /tmp/spike
+          : > "${RESULTS}"
+          echo "RESULT|spike.start|INFO|$(date -uIs)" >> "${RESULTS}"
+
+      # ------------------------------------------------------------------ 1
+      - name: 1. runner base environment
+        if: always()
+        run: |
+          set -x
+          echo "===== os ====="
+          cat /etc/os-release
+          lsb_release -a || true
+          echo "===== kernel ====="
+          uname -a
+          echo "===== cpu ====="
+          nproc
+          lscpu | head -25
+          echo "===== memory ====="
+          free -h
+          echo "===== disk ====="
+          df -h
+          df -h / /mnt || true
+          echo "===== whoami / sudo ====="
+          id
+          sudo -n true && echo "sudo: passwordless OK" || echo "sudo: NOT passwordless"
+          sudo id
+          echo "===== loop devices ====="
+          ls -la /dev/loop* || true
+          lsmod | grep -i loop || true
+          cat /sys/module/loop/parameters/max_part 2>/dev/null || true
+          echo "===== udev ====="
+          systemctl is-active systemd-udevd || true
+          udevadm --version || true
+          echo "===== mount / mknod capability probe ====="
+          sudo mkdir -p /tmp/spike/mnt-probe
+          sudo mount -t tmpfs tmpfs /tmp/spike/mnt-probe && echo "mount tmpfs: OK" || echo "mount tmpfs: FAIL"
+          sudo umount /tmp/spike/mnt-probe && echo "umount: OK" || echo "umount: FAIL"
+          sudo mknod /tmp/spike/probe-node b 7 200 && echo "mknod: OK" || echo "mknod: FAIL"
+          sudo rm -f /tmp/spike/probe-node
+          echo "===== preinstalled tool versions ====="
+          for t in apt dpkg tar zstd xz git gcc make python3 docker; do
+            printf '%-8s ' "$t"; command -v "$t" >/dev/null && "$t" --version 2>&1 | head -1 || echo "ABSENT"
+          done
+          {
+            echo "RESULT|runner.os|INFO|$(. /etc/os-release; echo "$PRETTY_NAME")"
+            echo "RESULT|runner.kernel|INFO|$(uname -r)"
+            echo "RESULT|runner.nproc|INFO|$(nproc)"
+            echo "RESULT|runner.mem_total|INFO|$(free -h | awk '/^Mem:/{print $2}')"
+            echo "RESULT|runner.disk_root_avail_before|INFO|$(df -h --output=avail / | tail -1 | tr -d ' ')"
+            echo "RESULT|runner.disk_mnt_avail_before|INFO|$(df -h --output=avail /mnt 2>/dev/null | tail -1 | tr -d ' ')"
+            echo "RESULT|runner.sudo_passwordless|INFO|$(sudo -n true 2>/dev/null && echo yes || echo no)"
+            echo "RESULT|runner.loop_max_part|INFO|$(cat /sys/module/loop/parameters/max_part 2>/dev/null || echo unknown)"
+            echo "RESULT|runner.udevd|INFO|$(systemctl is-active systemd-udevd 2>/dev/null || echo unknown)"
+          } >> "${RESULTS}"
+
+      # ------------------------------------------------------------------ 2a
+      - name: 2a. binfmt state BEFORE any install
+        if: always()
+        run: |
+          set -x
+          echo "===== /proc/sys/fs/binfmt_misc BEFORE ====="
+          ls -la /proc/sys/fs/binfmt_misc/ 2>&1 || echo "binfmt_misc not mounted"
+          cat /proc/sys/fs/binfmt_misc/status 2>&1 || true
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>&1 || echo "qemu-aarch64: NOT registered"
+          ls -la /usr/bin/qemu-aarch64-static 2>&1 || echo "qemu-aarch64-static: absent"
+          if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            echo "RESULT|binfmt.before|PRESENT|$(tr '\n' ' ' < /proc/sys/fs/binfmt_misc/qemu-aarch64)" >> "${RESULTS}"
+          else
+            echo "RESULT|binfmt.before|ABSENT|qemu-aarch64 handler not registered on fresh runner" >> "${RESULTS}"
+          fi
+          echo "RESULT|binfmt.misc_mounted|INFO|$([ -d /proc/sys/fs/binfmt_misc ] && echo yes || echo no)" >> "${RESULTS}"
+
+      # ------------------------------------------------------------------ 2b
+      - name: 2b. apt candidate versions (before install)
+        if: always()
+        run: |
+          set -x
+          sudo apt-get update
+          pkgs="mmdebstrap arch-test qemu-user-static binfmt-support debian-archive-keyring ubuntu-keyring gpg gpg-agent dirmngr apt-utils dctrl-tools \
+                build-essential debhelper devscripts dpkg-dev fakeroot quilt lsb-release \
+                gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev dwarves kmod cpio rsync \
+                u-boot-tools device-tree-compiler libfdt-dev libgnutls28-dev uuid-dev swig python3-dev python3-setuptools python3-pyelftools libpython3-dev python-is-python3 \
+                parted fdisk gdisk dosfstools e2fsprogs uuid-runtime util-linux udev \
+                ca-certificates curl wget file xz-utils zstd bzip2 patch"
+          for p in ${pkgs}; do
+            cand="$(apt-cache policy "$p" 2>/dev/null | awk -F': *' '/Candidate:/{print $2}')"
+            inst="$(apt-cache policy "$p" 2>/dev/null | awk -F': *' '/Installed:/{print $2}')"
+            if [ -z "${cand}" ] || [ "${cand}" = "(none)" ]; then
+              echo "RESULT|apt.candidate.${p}|MISSING|no candidate in noble" >> "${RESULTS}"
+            else
+              echo "RESULT|apt.candidate.${p}|OK|candidate=${cand} installed=${inst}" >> "${RESULTS}"
+            fi
+          done
+          grep '^RESULT|apt.candidate' "${RESULTS}"
+
+      # ------------------------------------------------------------------ 2c
+      - name: 2c. apt install per group
+        if: always()
+        run: |
+          install_group() {
+            local name="$1"; shift
+            echo "########## installing group: ${name} ##########"
+            if sudo apt-get install -y --no-install-recommends "$@"; then
+              echo "RESULT|apt.install.${name}|OK|$*" >> "${RESULTS}"
+            else
+              echo "RESULT|apt.install.${name}|FAIL|$*" >> "${RESULTS}"
+            fi
+          }
+          install_group general ca-certificates curl wget git file xz-utils zstd bzip2 patch lsb-release dctrl-tools
+          install_group rootfs mmdebstrap arch-test qemu-user-static binfmt-support debian-archive-keyring ubuntu-keyring gpg gpg-agent dirmngr apt-utils
+          install_group packaging build-essential debhelper devscripts dpkg-dev fakeroot quilt
+          install_group kernel-cross gcc-aarch64-linux-gnu bc bison flex libssl-dev libelf-dev dwarves kmod cpio rsync
+          install_group uboot u-boot-tools device-tree-compiler libfdt-dev libgnutls28-dev uuid-dev swig python3 python3-dev python3-setuptools python3-pyelftools python-is-python3 libpython3-dev
+          install_group image parted fdisk gdisk dosfstools e2fsprogs uuid-runtime util-linux udev
+          echo "===== installed versions of the ones that matter ====="
+          for p in mmdebstrap qemu-user-static binfmt-support arch-test debian-archive-keyring ubuntu-keyring gcc-aarch64-linux-gnu dwarves parted gdisk e2fsprogs u-boot-tools device-tree-compiler quilt debhelper; do
+            v="$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null || echo NOT-INSTALLED)"
+            echo "${p} ${v}"
+            echo "RESULT|version.${p}|INFO|${v}" >> "${RESULTS}"
+          done
+          mmdebstrap --version || true
+          echo "RESULT|version.mmdebstrap_selfreport|INFO|$(mmdebstrap --version 2>&1 | head -1)" >> "${RESULTS}"
+          echo "RESULT|version.apt|INFO|$(apt --version | head -1)" >> "${RESULTS}"
+          echo "RESULT|version.dpkg|INFO|$(dpkg --version | head -1)" >> "${RESULTS}"
+          echo "RESULT|version.gcc_aarch64|INFO|$(aarch64-linux-gnu-gcc --version 2>&1 | head -1)" >> "${RESULTS}"
+
+      # ------------------------------------------------------------------ 3
+      - name: 3. binfmt state AFTER install (auto-registration?)
+        if: always()
+        run: |
+          set -x
+          echo "===== /proc/sys/fs/binfmt_misc AFTER apt install ====="
+          ls -la /proc/sys/fs/binfmt_misc/ 2>&1 || true
+          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>&1 || echo "qemu-aarch64: NOT registered after install"
+          echo "===== update-binfmts --display qemu-aarch64 ====="
+          sudo update-binfmts --display qemu-aarch64 2>&1 || true
+          echo "===== /usr/share/binfmts/qemu-aarch64 ====="
+          cat /usr/share/binfmts/qemu-aarch64 2>&1 || true
+          auto=no
+          if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            auto=yes
+            echo "RESULT|binfmt.after_install|REGISTERED|$(tr '\n' ' ' < /proc/sys/fs/binfmt_misc/qemu-aarch64)" >> "${RESULTS}"
+          else
+            echo "RESULT|binfmt.after_install|NOT-REGISTERED|apt install alone did not register the handler" >> "${RESULTS}"
+            echo "===== trying the documented registration mechanisms (recorded separately) ====="
+            sudo systemctl restart systemd-binfmt 2>&1 || true
+            cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>&1 || true
+            if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+              echo "RESULT|binfmt.explicit_systemd_binfmt|REGISTERED|$(tr '\n' ' ' < /proc/sys/fs/binfmt_misc/qemu-aarch64)" >> "${RESULTS}"
+            else
+              sudo update-binfmts --enable qemu-aarch64 2>&1 || true
+              if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+                echo "RESULT|binfmt.explicit_update_binfmts|REGISTERED|$(tr '\n' ' ' < /proc/sys/fs/binfmt_misc/qemu-aarch64)" >> "${RESULTS}"
+              else
+                echo "RESULT|binfmt.explicit_registration|FAIL|neither systemd-binfmt nor update-binfmts registered it" >> "${RESULTS}"
+              fi
+            fi
+          fi
+          echo "RESULT|binfmt.auto_on_apt_install|INFO|${auto}" >> "${RESULTS}"
+          if [ -f /proc/sys/fs/binfmt_misc/qemu-aarch64 ]; then
+            flags="$(awk '/^flags:/{print $2}' /proc/sys/fs/binfmt_misc/qemu-aarch64)"
+            interp="$(awk '/^interpreter/{print $2}' /proc/sys/fs/binfmt_misc/qemu-aarch64)"
+            enabled="$(head -1 /proc/sys/fs/binfmt_misc/qemu-aarch64)"
+            echo "RESULT|binfmt.enabled|INFO|${enabled}" >> "${RESULTS}"
+            echo "RESULT|binfmt.interpreter|INFO|${interp}" >> "${RESULTS}"
+            echo "RESULT|binfmt.flags|INFO|${flags}" >> "${RESULTS}"
+            case "${flags}" in *F*) echo "RESULT|binfmt.fix_binary_F|YES|interpreter opened at registration time; works inside chroot without copying qemu in" >> "${RESULTS}" ;;
+                               *)   echo "RESULT|binfmt.fix_binary_F|NO|flags=${flags}; interpreter must exist inside the chroot" >> "${RESULTS}" ;; esac
+          fi
+          echo "===== arch-test ====="
+          arch-test arm64 2>&1 || true
+          echo "RESULT|arch_test.arm64|INFO|$(arch-test arm64 2>&1)" >> "${RESULTS}"
+          echo "===== can we actually run an arm64 binary? ====="
+          qemu-aarch64-static --version 2>&1 | head -2 || true
+
+      # ------------------------------------------------------------------ 4
+      - name: 4. keyring content check (do noble keyrings carry trixie/resolute keys?)
+        if: always()
+        run: |
+          set -x
+          for k in /usr/share/keyrings/debian-archive-keyring.gpg /usr/share/keyrings/ubuntu-archive-keyring.gpg; do
+            echo "########## ${k} ##########"
+            ls -la "${k}" 2>&1 || { echo "RESULT|keyring.$(basename ${k})|MISSING|not present" >> "${RESULTS}"; continue; }
+            gpg --no-default-keyring --keyring "${k}" --list-keys 2>&1 | sed -n '1,200p'
+            uids="$(gpg --no-default-keyring --keyring "${k}" --list-keys 2>/dev/null | grep -c '^uid' || true)"
+            echo "RESULT|keyring.$(basename ${k})|OK|uids=${uids} version=$(dpkg-query -W -f='${Version}' $(dpkg -S ${k} 2>/dev/null | cut -d: -f1) 2>/dev/null)" >> "${RESULTS}"
+          done
+          echo "===== which keys mention trixie / 13 / resolute / 26.04 ====="
+          gpg --no-default-keyring --keyring /usr/share/keyrings/debian-archive-keyring.gpg --list-keys 2>/dev/null | grep -iE 'uid|trixie|13' || true
+
+      # ------------------------------------------------------------------ 5
+      - name: 5. mmdebstrap compatibility spike (arm64 minbase, 4 suites, native root mode)
+        if: always()
+        run: |
+          # Same mirrors and keyrings the real build system uses:
+          #   debian -> deb.debian.org + debian-archive-keyring
+          #   ubuntu -> ports.ubuntu.com (arm64 lives there, not on archive.u.c)
+          run_suite() {
+            local suite="$1" mirror="$2" keyring="$3" components="$4"
+            local out="/tmp/spike/${suite}.tar"
+            echo "########## mmdebstrap ${suite} ##########"
+            local t0 t1 rc
+            t0=$(date +%s)
+            set +e
+            sudo mmdebstrap \
+              --architectures=arm64 \
+              --variant=minbase \
+              --components="${components}" \
+              --keyring="${keyring}" \
+              "${suite}" "${out}" "${mirror}" > "/tmp/spike/${suite}.log" 2>&1
+            rc=$?
+            set -e
+            t1=$(date +%s)
+            local secs=$(( t1 - t0 ))
+            echo "--- last 60 lines of ${suite} log ---"
+            tail -60 "/tmp/spike/${suite}.log"
+            if [ "${rc}" -eq 0 ] && [ -s "${out}" ]; then
+              local size
+              size="$(du -h "${out}" | cut -f1)"
+              # prove the tarball is really arm64
+              local elf
+              elf="$(tar -xOf "${out}" ./bin/bash 2>/dev/null | file - | head -1)"
+              echo "RESULT|mmdebstrap.${suite}|OK|${secs}s size=${size} bash=${elf}" >> "${RESULTS}"
+            else
+              echo "RESULT|mmdebstrap.${suite}|FAIL|rc=${rc} ${secs}s reason=$(grep -iE '^E:|error|cannot|unsupported|not found' "/tmp/spike/${suite}.log" | tail -3 | tr '\n' ' ')" >> "${RESULTS}"
+            fi
+            rm -f "${out}"
+          }
+          run_suite bookworm  http://deb.debian.org/debian          /usr/share/keyrings/debian-archive-keyring.gpg "main,contrib,non-free,non-free-firmware"
+          run_suite trixie    http://deb.debian.org/debian          /usr/share/keyrings/debian-archive-keyring.gpg "main,contrib,non-free,non-free-firmware"
+          run_suite noble     http://ports.ubuntu.com/ubuntu-ports  /usr/share/keyrings/ubuntu-archive-keyring.gpg "main,restricted,universe,multiverse"
+          run_suite resolute  http://ports.ubuntu.com/ubuntu-ports  /usr/share/keyrings/ubuntu-archive-keyring.gpg "main,restricted,universe,multiverse"
+          grep '^RESULT|mmdebstrap' "${RESULTS}"
+
+      # ------------------------------------------------------------------ 6
+      - name: 6. arm64 chroot execution probe
+        if: always()
+        run: |
+          # The real build system runs `chroot <rootfs> apt-get install ...` on an
+          # arm64 rootfs from an x86_64 host. That is the capability under test here.
+          set -x
+          rc=0
+          sudo mmdebstrap --architectures=arm64 --variant=minbase \
+            --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
+            --components="main,restricted,universe,multiverse" \
+            noble /tmp/spike/chroot-probe http://ports.ubuntu.com/ubuntu-ports \
+            > /tmp/spike/chroot-probe.log 2>&1 || rc=$?
+          tail -30 /tmp/spike/chroot-probe.log
+          if [ "${rc}" -ne 0 ]; then
+            echo "RESULT|chroot.arm64_exec|SKIPPED|could not create probe rootfs (rc=${rc})" >> "${RESULTS}"
+            exit 0
+          fi
+          file /tmp/spike/chroot-probe/bin/bash
+          out=""; crc=0
+          out="$(sudo chroot /tmp/spike/chroot-probe /bin/bash -c 'echo chroot-ok; uname -m; dpkg --print-architecture' 2>&1)" || crc=$?
+          echo "${out}"
+          if [ "${crc}" -eq 0 ]; then
+            echo "RESULT|chroot.arm64_exec|OK|$(echo "${out}" | tr '\n' ' ')" >> "${RESULTS}"
+          else
+            echo "RESULT|chroot.arm64_exec|FAIL|rc=${crc} ${out}" >> "${RESULTS}"
+          fi
+          # and the bind-mount lifecycle the real stages use
+          mrc=0
+          sudo mount -t proc proc /tmp/spike/chroot-probe/proc || mrc=1
+          sudo mount -t sysfs sys /tmp/spike/chroot-probe/sys || mrc=1
+          sudo mount -o bind /dev /tmp/spike/chroot-probe/dev || mrc=1
+          sudo mount -o bind /dev/pts /tmp/spike/chroot-probe/dev/pts || mrc=1
+          [ "${mrc}" -eq 0 ] && echo "RESULT|chroot.bind_mounts|OK|proc sysfs /dev /dev/pts" >> "${RESULTS}" \
+                             || echo "RESULT|chroot.bind_mounts|FAIL|see log" >> "${RESULTS}"
+          # apt inside the emulated chroot -- the slow part of a real build
+          arc=0
+          t0=$(date +%s)
+          sudo chroot /tmp/spike/chroot-probe /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -y update && apt-get -y install --no-install-recommends ca-certificates' > /tmp/spike/chroot-apt.log 2>&1 || arc=$?
+          t1=$(date +%s)
+          tail -20 /tmp/spike/chroot-apt.log
+          if [ "${arc}" -eq 0 ]; then
+            echo "RESULT|chroot.apt_install|OK|$(( t1 - t0 ))s for 'apt update + install ca-certificates' under qemu" >> "${RESULTS}"
+          else
+            echo "RESULT|chroot.apt_install|FAIL|rc=${arc} $(tail -3 /tmp/spike/chroot-apt.log | tr '\n' ' ')" >> "${RESULTS}"
+          fi
+          for m in dev/pts dev sys proc; do sudo umount -lf "/tmp/spike/chroot-probe/${m}" 2>/dev/null || true; done
+          sudo rm -rf /tmp/spike/chroot-probe
+
+      # ------------------------------------------------------------------ 7
+      - name: 7. loop / partition / mkfs / mount capability
+        if: always()
+        run: |
+          set -x
+          img=/tmp/spike/test.img
+          mnt=/tmp/spike/test-mnt
+          rc_all=OK
+          truncate -s 512M "${img}"
+          loop="$(sudo losetup --find --show --partscan "${img}")" || { echo "RESULT|image.losetup|FAIL|losetup --find --partscan failed" >> "${RESULTS}"; exit 0; }
+          echo "loop=${loop}"
+          echo "RESULT|image.losetup|OK|${loop} (--find --show --partscan)" >> "${RESULTS}"
+          sudo parted --script "${loop}" mklabel gpt mkpart writable ext4 16MiB 100% \
+            && echo "RESULT|image.parted|OK|gpt + 1 ext4 partition" >> "${RESULTS}" \
+            || echo "RESULT|image.parted|FAIL|parted" >> "${RESULTS}"
+          sudo sgdisk --typecode=1:B921B045-1DF0-41C3-AF44-4C6F280D3FAE "${loop}" \
+            && echo "RESULT|image.sgdisk|OK|typecode set (Linux root ARM-64)" >> "${RESULTS}" \
+            || echo "RESULT|image.sgdisk|FAIL|sgdisk" >> "${RESULTS}"
+          sudo partprobe "${loop}" || true
+          sleep 2
+          # Does udev create the partition node by itself here, or is the mknod
+          # fallback (needed in the container) actually required on the runner?
+          base="$(basename "${loop}")"
+          ls -la /dev/${base}* || true
+          if [ -b "${loop}p1" ]; then
+            echo "RESULT|image.partition_node_auto|YES|${loop}p1 appeared without mknod (udev present)" >> "${RESULTS}"
+          else
+            echo "RESULT|image.partition_node_auto|NO|${loop}p1 absent; mknod fallback would be required" >> "${RESULTS}"
+            for part in /sys/block/"${base}"/"${base}"p*; do
+              [ -d "${part}" ] || continue
+              name="$(basename "${part}")"; IFS=: read -r maj min < "${part}/dev"
+              sudo mknod "/dev/${name}" b "${maj}" "${min}" && echo "RESULT|image.mknod_fallback|OK|/dev/${name} ${maj}:${min}" >> "${RESULTS}"
+            done
+          fi
+          sudo mkfs.ext4 -q -m 2 -O ^orphan_file -U "$(uuidgen)" -L writable "${loop}p1" \
+            && echo "RESULT|image.mkfs_ext4|OK|-O ^orphan_file -m 2 accepted ($(dpkg-query -W -f='${Version}' e2fsprogs))" >> "${RESULTS}" \
+            || echo "RESULT|image.mkfs_ext4|FAIL|mkfs.ext4" >> "${RESULTS}"
+          mkdir -p "${mnt}"
+          sudo mount "${loop}p1" "${mnt}" \
+            && echo "RESULT|image.mount_loop_part|OK|${loop}p1 -> ${mnt}" >> "${RESULTS}" \
+            || echo "RESULT|image.mount_loop_part|FAIL|mount" >> "${RESULTS}"
+          echo hello | sudo tee "${mnt}/hello" > /dev/null && sudo cat "${mnt}/hello"
+          # the two raw dd writes the real image build does at LBA 64 / 16384
+          sudo dd if=/dev/zero of="${loop}" bs=512 seek=64 count=1 conv=notrunc,fsync status=none \
+            && echo "RESULT|image.dd_raw_lba|OK|raw write to loop device at LBA 64" >> "${RESULTS}" \
+            || echo "RESULT|image.dd_raw_lba|FAIL|dd to loop device" >> "${RESULTS}"
+          sudo sync
+          sudo umount "${mnt}" && echo "RESULT|image.umount|OK|" >> "${RESULTS}" || echo "RESULT|image.umount|FAIL|" >> "${RESULTS}"
+          sudo losetup -d "${loop}" && echo "RESULT|image.losetup_detach|OK|" >> "${RESULTS}" || echo "RESULT|image.losetup_detach|FAIL|" >> "${RESULTS}"
+          rm -f "${img}"; sudo rm -rf "${mnt}"
+          echo "RESULT|image.privileged_container_needed|INFO|not used anywhere in this workflow" >> "${RESULTS}"
+
+      # ------------------------------------------------------------------ 8
+      - name: 8. disk after, and results dump
+        if: always()
+        run: |
+          df -h / /mnt || true
+          {
+            echo "RESULT|runner.disk_root_avail_after|INFO|$(df -h --output=avail / | tail -1 | tr -d ' ')"
+            echo "RESULT|runner.disk_root_used_by_spike|INFO|see before/after"
+            echo "RESULT|spike.end|INFO|$(date -uIs)"
+          } >> "${RESULTS}"
+          echo "=================== RESULTS ==================="
+          cat "${RESULTS}"
+          {
+            echo '## environment-check results'
+            echo
+            echo '| key | status | detail |'
+            echo '|---|---|---|'
+            awk -F'|' '/^RESULT\|/{printf "| `%s` | %s | %s |\n", $2, $3, $4}' "${RESULTS}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: 9. upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: environment-check-logs
+          path: |
+            /tmp/spike/*.txt
+            /tmp/spike/*.log

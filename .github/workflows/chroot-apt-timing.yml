@@ -1,0 +1,114 @@
+# Follow-up to environment-check: measure apt throughput inside an emulated
+# arm64 chroot on a native runner.
+#
+# Why a second workflow: in environment-check the probe rootfs was bootstrapped
+# with `--variant=minbase` and no --include, and mmdebstrap's minbase (an alias
+# for `required`) does NOT put apt in the target -- apt is priority `important`.
+# The chroot itself executed fine; only the apt measurement was void. Here the
+# bootstrap carries apt, so the number is real.
+name: chroot-apt-timing
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  chroot-apt-timing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RESULTS: /tmp/spike/results-timing.txt
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: 0. setup
+        run: |
+          mkdir -p /tmp/spike
+          : > "${RESULTS}"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mmdebstrap arch-test qemu-user-static binfmt-support ubuntu-keyring zstd
+          echo "RESULT|runner.nproc|INFO|$(nproc)" >> "${RESULTS}"
+          echo "RESULT|runner.mem|INFO|$(free -h | awk '/^Mem:/{print $2}')" >> "${RESULTS}"
+          echo "RESULT|runner.cpu_model|INFO|$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo)" >> "${RESULTS}"
+          echo "RESULT|binfmt.flags|INFO|$(awk '/^flags:/{print $2}' /proc/sys/fs/binfmt_misc/qemu-aarch64)" >> "${RESULTS}"
+
+      - name: 1. bootstrap arm64 noble with apt present
+        if: always()
+        run: |
+          t0=$(date +%s); rc=0
+          sudo mmdebstrap \
+            --architectures=arm64 \
+            --variant=minbase \
+            --components="main,restricted,universe,multiverse" \
+            --include=ca-certificates,apt-utils \
+            --keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg \
+            noble /tmp/spike/rootfs http://ports.ubuntu.com/ubuntu-ports > /tmp/spike/bootstrap.log 2>&1 || rc=$?
+          t1=$(date +%s)
+          tail -20 /tmp/spike/bootstrap.log
+          if [ "${rc}" -eq 0 ]; then
+            echo "RESULT|bootstrap.noble_with_include|OK|$(( t1 - t0 ))s ($(sudo du -sh /tmp/spike/rootfs | cut -f1))" >> "${RESULTS}"
+          else
+            echo "RESULT|bootstrap.noble_with_include|FAIL|rc=${rc}" >> "${RESULTS}"; exit 1
+          fi
+          sudo chroot /tmp/spike/rootfs /bin/bash -c 'command -v apt-get && apt-get --version | head -1 && dpkg --print-architecture'
+          echo "RESULT|chroot.apt_present|OK|$(sudo chroot /tmp/spike/rootfs apt-get --version | head -1)" >> "${RESULTS}"
+
+      - name: 2. apt update + install inside emulated chroot (timed)
+        if: always()
+        run: |
+          r=/tmp/spike/rootfs
+          sudo mount -t proc proc "$r/proc"
+          sudo mount -t sysfs sys "$r/sys"
+          sudo mount -o bind /dev "$r/dev"
+          sudo mount -o bind /dev/pts "$r/dev/pts"
+          sudo cp /etc/resolv.conf "$r/etc/resolv.conf"
+
+          t0=$(date +%s)
+          sudo chroot "$r" /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -y update' > /tmp/spike/apt-update.log 2>&1 || true
+          t1=$(date +%s)
+          echo "RESULT|chroot.apt_update|INFO|$(( t1 - t0 ))s" >> "${RESULTS}"
+          tail -5 /tmp/spike/apt-update.log
+
+          # A moderate, representative set: init + locales + network + ssh.
+          t0=$(date +%s); rc=0
+          sudo chroot "$r" /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -y install --no-install-recommends systemd-sysv locales sudo netplan.io openssh-server' > /tmp/spike/apt-install.log 2>&1 || rc=$?
+          t1=$(date +%s)
+          tail -25 /tmp/spike/apt-install.log
+          n="$(sudo chroot "$r" dpkg-query -f '.\n' -W 2>/dev/null | wc -l)"
+          if [ "${rc}" -eq 0 ]; then
+            echo "RESULT|chroot.apt_install_5pkgs|OK|$(( t1 - t0 ))s; rootfs now has ${n} packages" >> "${RESULTS}"
+          else
+            echo "RESULT|chroot.apt_install_5pkgs|FAIL|rc=${rc} after $(( t1 - t0 ))s" >> "${RESULTS}"
+          fi
+
+          # locale-gen is a known CPU-heavy, fully emulated step in the real build.
+          t0=$(date +%s); rc=0
+          sudo chroot "$r" /bin/bash -c "sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen en_US.UTF-8" > /tmp/spike/locale.log 2>&1 || rc=$?
+          t1=$(date +%s)
+          echo "RESULT|chroot.locale_gen|$([ ${rc} -eq 0 ] && echo OK || echo FAIL)|$(( t1 - t0 ))s" >> "${RESULTS}"
+
+          # update-initramfs is the other heavy emulated step config-image.sh runs.
+          t0=$(date +%s); rc=0
+          sudo chroot "$r" /bin/bash -c 'export DEBIAN_FRONTEND=noninteractive; apt-get -y install --no-install-recommends initramfs-tools' > /tmp/spike/initramfs-tools.log 2>&1 || rc=$?
+          t1=$(date +%s)
+          echo "RESULT|chroot.install_initramfs_tools|$([ ${rc} -eq 0 ] && echo OK || echo FAIL)|$(( t1 - t0 ))s" >> "${RESULTS}"
+
+          for m in dev/pts dev sys proc; do sudo umount -lf "$r/$m" 2>/dev/null || true; done
+          echo "RESULT|disk.after|INFO|$(df -h --output=avail / | tail -1 | tr -d ' ') free on /" >> "${RESULTS}"
+          echo "================ RESULTS ================"
+          cat "${RESULTS}"
+          {
+            echo '## chroot-apt-timing results'
+            echo
+            echo '| key | status | detail |'
+            echo '|---|---|---|'
+            awk -F'|' '/^RESULT\|/{printf "| `%s` | %s | %s |\n", $2, $3, $4}' "${RESULTS}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: 3. upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chroot-apt-timing-logs
+          path: |
+            /tmp/spike/*.txt
+            /tmp/spike/*.log
